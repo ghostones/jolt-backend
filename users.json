@@ -1,0 +1,17 @@
+[
+  {
+    "username": "admin",
+    "password": "$2b$12$xSLpq12iHwQPdxCTHy1C/uHrY7bfFdsKj5Qk6mbNiOql6mHQ0xlbi",
+    "age": "38",
+    "bio": "",
+    "image": "",
+    "gender": "",
+    "interests": [],
+    "coins": 0,
+    "paidFeatures": {
+      "filtersUnlocked": false
+    },
+    "isPremium": false,
+    "groups": []
+  }
+]

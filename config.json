@@ -1,0 +1,17 @@
+{
+  "thresholds": {
+    "SAFE_MAX": 0.3,
+    "SUGGESTIVE_MAX": 0.5,
+    "PARTIAL_MAX": 0.7,
+    "EXPLICIT_MAX": 0.85,
+    "SEVERE_MAX": 0.95,
+    "ILLEGAL": 0.95
+  },
+  "warnings": {
+    "SUGGESTIVE": "Please ensure appropriate attire. Continued violations may result in restrictions.",
+    "PARTIAL": "Partial nudity detected. Please cover up or your session will be ended.",
+    "EXPLICIT": "Explicit content detected. You have been removed from this chat.",
+    "SEVERE": "Severe NSFW content detected. You have been temporarily banned for 1 hour.",
+    "ILLEGAL": "Illegal content detected. Your account has been permanently banned and authorities notified."
+  }
+}
