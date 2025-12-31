@@ -514,7 +514,8 @@ app.post('/login', async (req, res) => {
   const { username, password } = req.body;
   let users = loadUsers();
   const user = users.find(u => u.username === username);
-  if (user.premiumUntil && Date.now() > user.premiumUntil) {
+
+if (user && user.premiumUntil && Date.now() > user.premiumUntil) {
   user.isPremium = false;
   user.paidFeatures = { filtersUnlocked: false };
   user.premiumUntil = null;
@@ -550,21 +551,22 @@ res.json({
 
 app.post('/profile/update', requireSession, (req, res) => {
   const {
-    const {
-  age,
-  bio,
-  image,
-  gender,
-  interests,
-  coins,
-  paidFeatures,
-  isPremium,
-  groups
-} = req.body;
+    age,
+    bio,
+    image,
+    gender,
+    interests,
+    coins,
+    paidFeatures,
+    isPremium,
+    groups
+  } = req.body;
 
   let users = loadUsers();
-const user = users.find(u => u.username === req.username);
-  if (!user) return res.status(404).json({ message: 'User not found' });
+  const user = users.find(u => u.username === req.username);
+  if (!user) {
+    return res.status(404).json({ message: 'User not found' });
+  }
 
   if (typeof age !== 'undefined') user.age = age;
   if (typeof bio !== 'undefined') user.bio = bio;
@@ -577,19 +579,23 @@ const user = users.find(u => u.username === req.username);
   if (typeof groups !== 'undefined') user.groups = groups;
 
   saveUsers(users);
+
   res.json({
     message: 'Profile updated!',
-    age: user.age,
-    bio: user.bio,
-    image: user.image,
-    gender: user.gender,
-    interests: user.interests,
-    coins: user.coins,
-    paidFeatures: user.paidFeatures,
-    isPremium: user.isPremium,
-    groups: user.groups
+    profile: {
+      age: user.age,
+      bio: user.bio,
+      image: user.image,
+      gender: user.gender,
+      interests: user.interests,
+      coins: user.coins,
+      paidFeatures: user.paidFeatures,
+      isPremium: user.isPremium,
+      groups: user.groups
+    }
   });
 });
+
 
 // --- VIRTUAL COINS: BUY COINS (mock payment) ---
 app.post('/buy-coins', requireSession, (req, res) => {
