@@ -3,23 +3,27 @@ const plans = require('./plans');
 const { loadUsers, saveUsers } = require('../server');
 
 /* =========================
-   PAYPAL CLIENT
+   PAYPAL ENVIRONMENT
 ========================= */
 
-function environment() {
-  if (process.env.PAYPAL_MODE === 'live') {
-    return new paypal.core.LiveEnvironment(
-      process.env.PAYPAL_CLIENT_ID,
-      process.env.PAYPAL_CLIENT_SECRET
-    );
+function getPayPalClient() {
+  const clientId = process.env.PAYPAL_CLIENT_ID;
+  const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+
+  if (!clientId || !clientSecret) {
+    console.warn('⚠️ PayPal not initialized: missing env vars');
+    return null;
   }
-  return new paypal.core.SandboxEnvironment(
-    process.env.PAYPAL_CLIENT_ID,
-    process.env.PAYPAL_CLIENT_SECRET
-  );
+
+  const environment =
+    process.env.PAYPAL_MODE === 'live'
+      ? new paypal.core.LiveEnvironment(clientId, clientSecret)
+      : new paypal.core.SandboxEnvironment(clientId, clientSecret);
+
+  return new paypal.core.PayPalHttpClient(environment);
 }
 
-const client = new paypal.core.PayPalHttpClient(environment());
+const paypalClient = getPayPalClient();
 
 /* =========================
    ROUTES
@@ -27,9 +31,13 @@ const client = new paypal.core.PayPalHttpClient(environment());
 
 module.exports = function paypalRoutes(app, requireSession) {
 
-  // 1️⃣ Create PayPal Order
+  // 1️⃣ Create Order
   app.post('/payments/paypal/create-order', requireSession, async (req, res) => {
     try {
+      if (!paypalClient) {
+        return res.status(503).json({ message: 'PayPal not configured' });
+      }
+
       const { plan } = req.body;
       if (!plans[plan]) {
         return res.status(400).json({ message: 'Invalid plan' });
@@ -47,7 +55,7 @@ module.exports = function paypalRoutes(app, requireSession) {
         }]
       });
 
-      const order = await client.execute(request);
+      const order = await paypalClient.execute(request);
       res.json({ orderId: order.result.id });
 
     } catch (err) {
@@ -56,22 +64,26 @@ module.exports = function paypalRoutes(app, requireSession) {
     }
   });
 
-  // 2️⃣ Capture PayPal Payment
+  // 2️⃣ Capture Payment
   app.post('/payments/paypal/capture', requireSession, async (req, res) => {
     try {
+      if (!paypalClient) {
+        return res.status(503).json({ message: 'PayPal not configured' });
+      }
+
       const { orderId } = req.body;
       const request = new paypal.orders.OrdersCaptureRequest(orderId);
       request.requestBody({});
 
-      await client.execute(request);
+      await paypalClient.execute(request);
 
-      // ✅ Activate premium (example: monthly)
+      // ✅ Activate Premium
       const users = loadUsers();
       const user = users.find(u => u.username === req.username);
 
       user.isPremium = true;
       user.paidFeatures = { filtersUnlocked: true };
-      user.premiumUntil = Date.now() + (30 * 24 * 60 * 60 * 1000);
+      user.premiumUntil = Date.now() + (30 * 24 * 60 * 60 * 1000); // 30 days
 
       saveUsers(users);
 
