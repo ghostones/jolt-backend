@@ -1,34 +1,50 @@
-const Razorpay = require('razorpay');
 const crypto = require('crypto');
 const plans = require('./plans');
 const { loadUsers, saveUsers } = require('../server');
-// (we’ll explain this import below)
+const Razorpay = require("razorpay");
 
-const razorpay = new Razorpay({
-  key_id: process.env.RAZORPAY_KEY_ID,
-  key_secret: process.env.RAZORPAY_KEY_SECRET
-});
+// ✅ Safe Razorpay initialization
+let razorpay = null;
 
+if (!process.env.RAZORPAY_KEY_ID || !process.env.RAZORPAY_KEY_SECRET) {
+  console.warn("⚠️ Razorpay not initialized: missing env vars");
+} else {
+  razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET,
+  });
+}
+
+// ✅ Export ONLY routes
 module.exports = function razorpayRoutes(app, requireSession) {
 
   // 1️⃣ Create Order
   app.post('/payments/razorpay/create-order', requireSession, async (req, res) => {
+    if (!razorpay) {
+      return res.status(503).json({ message: "Payments unavailable" });
+    }
+
     const { plan } = req.body;
     if (!plans[plan]) {
       return res.status(400).json({ message: 'Invalid plan' });
     }
 
-    const order = await razorpay.orders.create({
-      amount: plans[plan].inr,
-      currency: 'INR',
-      receipt: `jolt_${req.username}_${Date.now()}`
-    });
+    try {
+      const order = await razorpay.orders.create({
+        amount: plans[plan].inr,
+        currency: 'INR',
+        receipt: `jolt_${req.username}_${Date.now()}`
+      });
 
-    res.json({
-      orderId: order.id,
-      keyId: process.env.RAZORPAY_KEY_ID,
-      amount: order.amount
-    });
+      res.json({
+        orderId: order.id,
+        keyId: process.env.RAZORPAY_KEY_ID,
+        amount: order.amount
+      });
+    } catch (err) {
+      console.error("Razorpay order error:", err);
+      res.status(500).json({ message: "Order creation failed" });
+    }
   });
 
   // 2️⃣ Verify Payment
@@ -45,13 +61,18 @@ module.exports = function razorpayRoutes(app, requireSession) {
       return res.status(400).json({ message: 'Payment verification failed' });
     }
 
-    // ✅ Unlock premium
     const users = loadUsers();
     const user = users.find(u => u.username === req.username);
+
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+
+    // ✅ Unlock premium (FIXED logic)
     user.isPremium = true;
-user.paidFeatures = { filtersUnlocked: true };
-user.premiumUntil = Date.now() + (30 * 24 * 60 * 60 * 1000); // 30 days
-user.premiumUntil = Date.now() + (365 * 24 * 60 * 60 * 1000); // 1 year
+    user.paidFeatures = { filtersUnlocked: true };
+    user.premiumUntil = Date.now() + (365 * 24 * 60 * 60 * 1000); // 1 year
+
     saveUsers(users);
 
     res.json({ message: 'Premium activated' });
