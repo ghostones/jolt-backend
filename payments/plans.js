@@ -37,3 +37,4 @@ module.exports = {
     durationDays: 365
   }
 };
+Object.freeze(module.exports);
