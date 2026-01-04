@@ -16,10 +16,11 @@ const MODERATION_ENABLED =
   process.env.MODERATION_ENABLED === 'true' &&
   Boolean(process.env.PERSPECTIVE_API_KEY);
 const app = express();
+// ✅ Serve frontend (public)
 const server = http.createServer(app);
 const port = process.env.PORT || 1234;
 if (!process.env.PERSPECTIVE_API_KEY) {
-  console.error('❌ PERSPECTIVE_API_KEY missing in environment');
+  console.warn('⚠️ Perspective API not configured — moderation disabled');
 }
 // 🔐 SECURITY: Allowed origins (anti-clone, anti-scrape)
 const ALLOWED_ORIGINS = [
@@ -28,6 +29,11 @@ const ALLOWED_ORIGINS = [
   'capacitor://localhost',     // Android / iOS WebView
   'http://localhost:3000'      // local dev
 ];
+app.get('/app', (req, res) => {
+  res.sendFile(
+    path.join(__dirname, 'public/app/index.html')
+  );
+});
 
 // --- Socket.IO with proper CORS and Transport Options ---
 const { Server } = require('socket.io');
@@ -60,19 +66,6 @@ const io = new Server(server, {
 // ✅ Tiny request logger (helps debugging)
 app.use((req, _res, next) => {
   console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
-  next();
-});
-
-// 🔐 SECURITY: Origin enforcement (HTTP layer, does NOT replace CORS)
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-
-  // WebView & same-origin requests may have null origin
-  if (origin && origin !== 'null' && !ALLOWED_ORIGINS.includes(origin)) {
-    console.warn('HTTP blocked origin:', origin);
-    return res.status(403).json({ message: 'Forbidden origin' });
-  }
-
   next();
 });
 
@@ -121,6 +114,7 @@ app.use((req, res, next) => {
 
 // JSON body parser
 app.use(express.json({ limit: '2mb' }));
+require('./payments/razorpay.webhook')(app);
 
 // 🔐 HARDENED HTTP RATE LIMIT (IP-based, safe for Render)
 const rateLimit = new Map();
@@ -128,7 +122,15 @@ const rateLimit = new Map();
 app.set('trust proxy', true); // 🔐 required for Render / Netlify
 
 app.use((req, res, next) => {
-  // Skip health & root
+    // ✅ ALWAYS allow payment webhooks (Razorpay / PayPal)
+  if (
+    req.path.startsWith('/razorpay') ||
+    req.path.startsWith('/paypal') ||
+    req.path.includes('webhook')
+  ) {
+    return next();
+  }
+// Skip health & root
   if (req.path === '/' || req.path === '/health') {
     return next();
   }
@@ -164,7 +166,22 @@ app.use((req, res, next) => {
       message: 'Too many requests. Please slow down.'
     });
   }
-
+// ✅ Allow frontend assets & pages FIRST
+if (
+  req.method === 'GET' &&
+  (
+    req.path.startsWith('/app') ||
+    req.path.startsWith('/styles') ||
+    req.path.startsWith('/dist') ||
+    req.path.endsWith('.html') ||
+    req.path.endsWith('.css') ||
+    req.path.endsWith('.js') ||
+    req.path.endsWith('.ico') ||
+    req.path.endsWith('.webmanifest')
+  )
+) {
+  return next();
+}
   /* 🤖 BOT / SCRAPER DETECTION (PASSIVE & SAFE) */
   const suspicious =
     !ua ||
@@ -173,12 +190,10 @@ app.use((req, res, next) => {
     (!accept.includes('text/html') &&
       !accept.includes('application/json'));
 
-  if (suspicious) {
-    console.warn(
-      `🤖 Suspicious HTTP client blocked | ip=${ip} ua="${ua}"`
-    );
-    return res.status(403).json({ message: 'Forbidden' });
-  }
+if (suspicious) {
+  console.warn(`🤖 Blocked suspicious client: ${ip} ${ua}`);
+  return res.status(403).json({ message: 'Forbidden' });
+}
 
   // 🧹 Memory cleanup
   if (rateLimit.size > 10_000) {
@@ -651,10 +666,6 @@ if (to === from) {
   if (sender.coins < giftCost) {
     return res.status(400).json({ message: 'Not enough coins.' });
   }
-return res.json({
-  message: 'Gift sent successfully.',
-  remainingCoins: sender.coins
-});
 
   // Deduct coins
   sender.coins -= giftCost;
