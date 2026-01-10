@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 const plans = require('./plans');
-const { loadUsers, saveUsers } = require('../server');
+const { loadUsers, saveUsers } = require('../users');
 
 module.exports = function razorpayWebhook(app) {
 
