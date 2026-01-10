@@ -1,0 +1,26 @@
+QUICK SETUP GUIDE - Environment Variables
+
+1. Create a file named ".env" in the jolt-backend directory
+
+2. Add the following lines to .env:
+
+   # Razorpay (for Indian payments)
+   RAZORPAY_KEY_ID=your_razorpay_key_id_here
+   RAZORPAY_KEY_SECRET=your_razorpay_key_secret_here
+
+   # PayPal (for international payments)
+   PAYPAL_CLIENT_ID=your_paypal_client_id_here
+   PAYPAL_CLIENT_SECRET=your_paypal_client_secret_here
+   PAYPAL_MODE=sandbox
+
+3. Get your keys:
+   - Razorpay: https://razorpay.com/ → Settings → API Keys
+   - PayPal: https://developer.paypal.com/ → Dashboard → My Apps & Credentials
+
+4. Restart your server after adding the .env file
+
+5. Check the server console - you should see:
+   ✅ Razorpay initialized successfully
+   ✅ PayPal initialized successfully (sandbox mode)
+
+NOTE: The .env file should NOT be committed to git (it's already in .gitignore)

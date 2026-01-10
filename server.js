@@ -4,134 +4,291 @@
  * Unauthorized copying, modification, or redistribution is prohibited.
  */
 
+// Load environment variables from .env file if it exists
+require('dotenv').config();
+
 const axios = require('axios');
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const cors = require('cors');
 const http = require('http');
-const bcrypt = require('bcrypt'); // ✅ CHANGE: moved to top for clarity
+const bcrypt = require('bcrypt');
 const crypto = require('crypto');
+const { verifyRequestSignature, decryptPayload } = require('./security');
 const MODERATION_ENABLED =
   process.env.MODERATION_ENABLED === 'true' &&
   Boolean(process.env.PERSPECTIVE_API_KEY);
 const app = express();
-// ✅ Serve frontend (public)
+
+// Security: Disable X-Powered-By header
+app.disable('x-powered-by');
+
+// Security headers
+app.use((req, res, next) => {
+  // Prevent clickjacking
+  res.setHeader('X-Frame-Options', 'DENY');
+  // Prevent MIME type sniffing
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  // XSS protection
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  // Referrer policy
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  // Content Security Policy (adjust as needed)
+  if (process.env.NODE_ENV === 'production') {
+    res.setHeader('Content-Security-Policy', "default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.socket.io; style-src 'self' 'unsafe-inline';");
+  }
+  next();
+});
+
+// Define DEBUG_MODE early
+const DEBUG_MODE = process.env.DEBUG === 'true';
+
+// API paths
+const API_PATHS = ['/signup', '/login', '/profile/update', '/report', '/block', '/buy-coins', '/gift', '/gifts-history'];
+
 const server = http.createServer(app);
 const port = process.env.PORT || 1234;
 if (!process.env.PERSPECTIVE_API_KEY) {
-  console.warn('⚠️ Perspective API not configured — moderation disabled');
+  console.warn('Perspective API not configured — moderation disabled');
 }
-// 🔐 SECURITY: Allowed origins (anti-clone, anti-scrape)
-const ALLOWED_ORIGINS = [
-  'https://joltchat.org',
-  'https://www.joltchat.org',
-  'capacitor://localhost',     // Android / iOS WebView
-  'http://localhost:3000'      // local dev
-];
-app.get('/app', (req, res) => {
-  res.sendFile(
-    path.join(__dirname, 'public/app/index.html')
-  );
-});
 
-// --- Socket.IO with proper CORS and Transport Options ---
+// Allowed origins for CORS
+// Load from environment variable (comma-separated) or use defaults
+const ALLOWED_ORIGINS_ENV = process.env.ALLOWED_ORIGINS;
+const ALLOWED_ORIGINS = ALLOWED_ORIGINS_ENV 
+  ? ALLOWED_ORIGINS_ENV.split(',').map(orig => orig.trim())
+  : [
+      'https://joltchat.org',
+      'https://www.joltchat.org',
+      'capacitor://localhost',     // Android / iOS WebView
+      'http://localhost:3000',    // local dev
+      'http://127.0.0.1:5500',    // local dev
+      'http://localhost:1234'     // local backend dev
+    ];
+
+// Add Netlify patterns (supports *.netlify.app and custom domains)
+if (process.env.ALLOW_NETLIFY === 'true' || !ALLOWED_ORIGINS_ENV) {
+  // Netlify patterns will be checked dynamically
+}
+
+// Helper function to check if origin is allowed
+function isOriginAllowed(origin) {
+  if (!origin || origin === 'null') {
+    return true; // Allow same-origin requests and WebView
+  }
+  
+  // Check exact matches
+  if (ALLOWED_ORIGINS.includes(origin)) {
+    return true;
+  }
+  
+  // Check Netlify domains (*.netlify.app and custom domains)
+  try {
+    const url = new URL(origin);
+    const hostname = url.hostname;
+    
+    // Allow Netlify domains if ALLOW_NETLIFY is true or not explicitly set
+    if (process.env.ALLOW_NETLIFY === 'true' || (!ALLOWED_ORIGINS_ENV && process.env.ALLOW_NETLIFY !== 'false')) {
+      // Allow *.netlify.app domains
+      if (hostname.endsWith('.netlify.app')) {
+        return true;
+      }
+      // Allow netlify.app subdomains
+      if (hostname === 'netlify.app' || hostname.includes('.netlify.app')) {
+        return true;
+      }
+    }
+  } catch (e) {
+    // Invalid URL, continue to check
+  }
+  
+  // In development OR if not explicitly set to production, allow any localhost origin (different ports)
+  // This ensures localhost works even if NODE_ENV is not set
+  const isProduction = process.env.NODE_ENV === 'production';
+  if (!isProduction) {
+    try {
+      const url = new URL(origin);
+      const hostname = url.hostname.toLowerCase();
+      // Allow localhost, 127.0.0.1, ::1, and any local IP
+      if (hostname === 'localhost' || 
+          hostname === '127.0.0.1' || 
+          hostname === '::1' ||
+          hostname.startsWith('192.168.') ||
+          hostname.startsWith('10.') ||
+          hostname === '0.0.0.0') {
+        return true;
+      }
+    } catch (e) {
+      // Invalid URL, continue to check
+    }
+  }
+  
+  return false;
+}
+
+// --- Socket.IO Configuration ---
 const { Server } = require('socket.io');
 const io = new Server(server, {
   cors: {
     origin: (origin, callback) => {
-      // Allow WebView, same-origin, server-to-server
-      if (!origin || origin === 'null') {
+      // Always allow requests without origin (same-origin, mobile apps, etc.)
+      if (!origin) {
         return callback(null, true);
       }
-
-      if (ALLOWED_ORIGINS.includes(origin)) {
+      
+      if (isOriginAllowed(origin)) {
+        if (DEBUG_MODE) {
+          console.log(`Socket.IO CORS allowed origin: ${origin}`);
+        }
         return callback(null, true);
       }
-
       console.warn('Socket.IO CORS blocked origin:', origin);
       return callback(new Error('Not allowed by CORS'));
     },
     methods: ['GET', 'POST'],
-    credentials: true
+    credentials: true,
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Id', 'X-Requested-With', 'Accept'],
+    exposedHeaders: ['Content-Type', 'Authorization']
   },
   transports: ['websocket', 'polling'],
   allowEIO3: true,
   pingTimeout: 60000,
-  pingInterval: 25000,
+  pingInterval: 25025,
   maxHttpBufferSize: 1e8,
   perMessageDeflate: false
 });
 
-// ✅ Tiny request logger (helps debugging)
-app.use((req, _res, next) => {
-  console.log(`${new Date().toISOString()} ${req.method} ${req.url}`);
-  next();
-});
-
-// ✅ Enhanced CORS Middleware (Express)
+// CORS Middleware - MUST be VERY FIRST (right after security headers) to handle OPTIONS preflight
 app.use(
   cors({
     origin: (origin, callback) => {
-      // Allow WebView, same-origin, server-to-server
-      if (!origin || origin === 'null') {
+      // Always allow requests without origin (same-origin, Postman, curl, etc.)
+      if (!origin) {
         return callback(null, true);
       }
-
-      if (ALLOWED_ORIGINS.includes(origin)) {
+      
+      if (DEBUG_MODE) {
+        console.log(`CORS check - Origin: ${origin || 'null'}, Allowed: ${isOriginAllowed(origin)}`);
+      }
+      if (isOriginAllowed(origin)) {
         return callback(null, true);
       }
-
       console.warn('HTTP CORS blocked origin:', origin);
+      console.warn('Current NODE_ENV:', process.env.NODE_ENV || 'not set');
       return callback(new Error('Not allowed by CORS'));
     },
     credentials: true,
-    methods: ['GET', 'POST', 'OPTIONS']
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Session-Id', 'X-Requested-With', 'Accept', 'X-Request-Signature', 'X-Request-Timestamp', 'X-Request-Nonce', 'Origin', 'Access-Control-Request-Method', 'Access-Control-Request-Headers'],
+    exposedHeaders: ['Content-Type', 'Authorization'],
+    optionsSuccessStatus: 200,
+    preflightContinue: false
   })
 );
 
-// ✅ OPTIONS preflight handler (NO wildcard headers)
-app.use((req, res, next) => {
+// JSON body parser (must come after CORS)
+app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: true, limit: '2mb' }));
+
+// Webhook handlers (must be before other routes to bypass body parsing issues)
+require('./payments/razorpay.webhook')(app);
+
+// Request validation middleware
+const nonceStore = new Map();
+
+function validateApiRequest(req, res, next) {
+  // Skip validation for OPTIONS requests (CORS preflight)
   if (req.method === 'OPTIONS') {
-    res.header(
-      'Access-Control-Allow-Origin',
-      req.headers.origin && ALLOWED_ORIGINS.includes(req.headers.origin)
-        ? req.headers.origin
-        : ''
-    );
-    res.header(
-      'Access-Control-Allow-Methods',
-      'GET, POST, OPTIONS'
-    );
-    res.header(
-      'Access-Control-Allow-Headers',
-      'Content-Type, Authorization'
-    );
-    return res.sendStatus(200);
+    return next();
+  }
+  
+  // Signature validation is optional in development (default: disabled)
+  // Enable it by setting REQUIRE_API_SIGNATURE=true
+  const isDevelopment = !process.env.NODE_ENV || process.env.NODE_ENV === 'development';
+  const requireSignature = process.env.REQUIRE_API_SIGNATURE === 'true' || process.env.NODE_ENV === 'production';
+  
+  // Skip signature validation in development unless explicitly enabled
+  if (!requireSignature) {
+    return next();
+  }
+  
+  // Check for request signature
+  const signature = req.headers['x-request-signature'];
+  const timestamp = req.headers['x-request-timestamp'];
+  const nonce = req.headers['x-request-nonce'];
+  
+  if (!signature || !timestamp || !nonce) {
+    return res.status(401).json({ message: 'Unauthorized' });
+  }
+  
+  // Verify signature
+  const payload = req.body || {};
+  const verification = verifyRequestSignature(payload, parseInt(timestamp), nonce, signature);
+  
+  if (!verification.valid) {
+    return res.status(401).json({ message: 'Invalid request signature' });
+  }
+  
+  // Check nonce (prevent replay)
+  if (nonceStore.has(nonce)) {
+    return res.status(401).json({ message: 'Duplicate request' });
+  }
+  
+  nonceStore.set(nonce, Date.now());
+  
+  // Clean old nonces (older than 5 minutes)
+  if (nonceStore.size > 10000) {
+    const now = Date.now();
+    for (const [storedNonce, storedTime] of nonceStore.entries()) {
+      if (now - storedTime > 5 * 60 * 1000) {
+        nonceStore.delete(storedNonce);
+      }
+    }
+  }
+  
+  next();
+}
+
+// Rate limiting
+const rateLimit = new Map();
+app.set('trust proxy', true);
+
+// Debug logging for API requests
+app.use((req, res, next) => {
+  const path = req.path.split('?')[0];
+  if (API_PATHS.includes(path) && DEBUG_MODE) {
+    console.log(`${new Date().toISOString()} ${req.method} ${path} - Origin: ${req.headers.origin || 'none'}`);
   }
   next();
 });
 
-// JSON body parser
-app.use(express.json({ limit: '2mb' }));
-require('./payments/razorpay.webhook')(app);
-
-// 🔐 HARDENED HTTP RATE LIMIT (IP-based, safe for Render)
-const rateLimit = new Map();
-
-app.set('trust proxy', true); // 🔐 required for Render / Netlify
-
+// Pre-check: Allow API endpoints before security checks
 app.use((req, res, next) => {
-    // ✅ ALWAYS allow payment webhooks (Razorpay / PayPal)
-  if (
-    req.path.startsWith('/razorpay') ||
-    req.path.startsWith('/paypal') ||
-    req.path.includes('webhook')
-  ) {
+  const path = req.path.split('?')[0];
+  
+  if (API_PATHS.includes(path)) {
+    // Apply request validation for API endpoints (but only if signature is required)
+    return validateApiRequest(req, res, next);
+  }
+  next();
+});
+
+// Security middleware: Rate limiting and bot detection
+app.use((req, res, next) => {
+  // Allow payment webhooks and payment routes
+  if (req.path.startsWith('/razorpay') || req.path.startsWith('/paypal') || req.path.includes('webhook') || req.path.startsWith('/payments/')) {
     return next();
   }
-// Skip health & root
-  if (req.path === '/' || req.path === '/health') {
+  
+  // Allow health, root, and online-count endpoints
+  if (req.path === '/' || req.path === '/health' || req.path === '/online-count') {
+    return next();
+  }
+
+  // Skip security checks for API endpoints
+  const pathWithoutQuery = req.path.split('?')[0];
+  if (API_PATHS.includes(pathWithoutQuery)) {
     return next();
   }
 
@@ -159,17 +316,15 @@ app.use((req, res, next) => {
 
   entry.count += 1;
 
-  // 🔐 Burst protection
+  // Burst protection (120 requests per minute)
   if (entry.count > 120) {
-    console.warn(`⛔ HTTP rate limit hit from IP: ${ip}`);
+    console.warn(`HTTP rate limit hit from IP: ${ip}`);
     return res.status(429).json({
       message: 'Too many requests. Please slow down.'
     });
   }
-// ✅ Allow frontend assets & pages FIRST
-if (
-  req.method === 'GET' &&
-  (
+  // Allow frontend assets
+  if (req.method === 'GET' && (
     req.path.startsWith('/app') ||
     req.path.startsWith('/styles') ||
     req.path.startsWith('/dist') ||
@@ -178,24 +333,28 @@ if (
     req.path.endsWith('.js') ||
     req.path.endsWith('.ico') ||
     req.path.endsWith('.webmanifest')
-  )
-) {
-  return next();
-}
-  /* 🤖 BOT / SCRAPER DETECTION (PASSIVE & SAFE) */
-  const suspicious =
-    !ua ||
-    ua.length < 20 ||
-    /curl|wget|python|node|axios|httpclient|scrapy|go-http|headless/i.test(ua) ||
-    (!accept.includes('text/html') &&
-      !accept.includes('application/json'));
+  )) {
+    return next();
+  }
+  
+  // Bot detection (disabled in development)
+  const isDevelopment = !process.env.NODE_ENV || process.env.NODE_ENV === 'development';
+  if (isDevelopment) {
+    return next();
+  }
+  
+  if (process.env.NODE_ENV === 'production') {
+    const suspicious = (!ua || ua.length < 10) && 
+                       !accept.includes('application/json') && 
+                       !accept.includes('text/html');
 
-if (suspicious) {
-  console.warn(`🤖 Blocked suspicious client: ${ip} ${ua}`);
-  return res.status(403).json({ message: 'Forbidden' });
-}
+    if (suspicious && (!ua || !accept)) {
+      console.warn(`Blocked suspicious client: ${ip} ${ua || 'no-UA'} ${accept || 'no-Accept'}`);
+      return res.status(403).json({ message: 'Forbidden' });
+    }
+  }
 
-  // 🧹 Memory cleanup
+  // Memory cleanup
   if (rateLimit.size > 10_000) {
     for (const [k, v] of rateLimit) {
       if (now - v.ts > 120_000) rateLimit.delete(k);
@@ -205,39 +364,14 @@ if (suspicious) {
   next();
 });
 
-
-
 // --- USERS db ---
-const dbFile = path.join(__dirname, 'users.json');
-function loadUsers() {
-  let raw = '[]';
-  try {
-    if (fs.existsSync(dbFile)) raw = fs.readFileSync(dbFile, 'utf8') || '[]'; // ✅ CHANGE: fallback to '[]'
-    let users = JSON.parse(raw);
-    if (!Array.isArray(users)) {
-      users = [];
-      const tmpFile = `${dbFile}.tmp`;
-fs.writeFileSync(tmpFile, JSON.stringify(users, null, 2), { mode: 0o600 });
-fs.renameSync(tmpFile, dbFile);
-    }
-    return users;
-  } catch (err) {
-    console.error('Error loading users.json:', err); // ✅ CHANGE: log error
-    fs.writeFileSync(dbFile, JSON.stringify([], null, 2));
-    return [];
-  }
-}
-function saveUsers(users) {
-  const tmp = `${dbFile}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(users, null, 2));
-  fs.renameSync(tmp, dbFile);
-}
+const { loadUsers, saveUsers } = require('./users');
 // ================= SESSION STORE =================
 // sessionId -> { username, createdAt, execToken, ageVerified }
 
 const sessions = new Map();
 
-/* 🔐 Session TTL cleanup (30 minutes idle) */
+// Session TTL cleanup (30 minutes idle)
 setInterval(() => {
   const now = Date.now();
   for (const [id, session] of sessions.entries()) {
@@ -247,23 +381,17 @@ setInterval(() => {
   }
 }, 10 * 60 * 1000);
 
-/*
-  🔐 ACTIVE SOCKET TRACKING
-  sessionId -> socket.id
-*/
+// Active socket tracking: sessionId -> socket.id
 const activeSockets = new Map();
 
-/*
-  🔐 RECONNECT THROTTLE
-  sessionId -> lastConnectTimestamp
-*/
+// Reconnect throttle: sessionId -> lastConnectTimestamp
 const reconnectThrottle = new Map();
 
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 function createSession(username, ageVerified = false) {
   const sessionId = crypto.randomUUID();
-  const execToken = crypto.randomBytes(32).toString('hex'); // 🔐 anti-replay token
+  const execToken = crypto.randomBytes(32).toString('hex'); // Anti-replay token
 
   sessions.set(sessionId, {
     username,
@@ -297,7 +425,7 @@ function requireSession(req, res, next) {
   }
 
   req.username = session.username;
-  req.session = session; // 🔐 expose execToken & ageVerified
+  req.session = session; // Expose execToken & ageVerified
   next();
 }
 
@@ -350,14 +478,14 @@ app.post('/report', requireSession, (req, res) => {
   });
 
   saveReports(reports);
-   // 🔐 SAFETY: Immediately disconnect reported user if online
+  // Immediately disconnect reported user if online
   for (const s of io.sockets.sockets.values()) {
     if (s.username && s.username.toLowerCase() === reported.toLowerCase()) {
       s.emit('chatEnded');
       s.disconnect(true);
     }
   }
- res.json({ message: 'Report received.' });
+  res.json({ message: 'Report received.' });
 });
 
 
@@ -479,19 +607,25 @@ app.get('/gifts-history', (req, res) => {
     return res.status(400).json({ message: 'Username is required.' });
   }
 
-  const gifts = loadGifts();
-  const filtered = gifts
-    .filter(g => g.from === username || g.to === username)
-    .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
-    .slice(0, 20);
+  try {
+    const gifts = loadGifts();
+    const filtered = gifts
+      .filter(g => g.from === username || g.to === username)
+      .sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp))
+      .slice(0, 20);
 
-  res.json({ gifts: filtered });
+    res.json({ gifts: filtered || [] });
+  } catch (error) {
+    console.error('Error loading gift history:', error);
+    res.status(500).json({ message: 'Failed to load gift history', gifts: [] });
+  }
 });
 
 // --- HEALTH & PROFILE ---
 app.get('/', (req, res) => {
-  res.send('Welcome to JOLT - Future of Random Chat! 🚀');
+  res.send('Welcome to JOLT - Future of Random Chat!');
 });
+
 app.get('/health', (req, res) => {
   res.json({ status: 'Server is running', project: 'JOLT' });
 });
@@ -508,55 +642,60 @@ app.post('/signup', async (req, res) => {
   }
   const hash = await bcrypt.hash(password, 12);
   users.push({
-  username,
-  password: hash,
-  age: age || '',
-  bio: bio || '',
-  image: '',
-  gender: gender || '',
-  interests: interests || [],
-  coins: 0,
-  paidFeatures: { filtersUnlocked: false },
-  isPremium: false,
-  premiumUntil: null,   // 👈 ADD THIS
-  groups: []
-});
+    username,
+    password: hash,
+    age: age || '',
+    bio: bio || '',
+    image: '',
+    gender: gender || '',
+    interests: interests || [],
+    coins: 0,
+    paidFeatures: { filtersUnlocked: false },
+    isPremium: false,
+    premiumUntil: null,   // 👈 ADD THIS
+    groups: []
+  });
   saveUsers(users);
   res.json({ message: 'Signup successful! Login now.' });
 });
 
 app.post('/login', async (req, res) => {
+  if (DEBUG_MODE) console.log('LOGIN:', req.body.username);
   const { username, password } = req.body;
   let users = loadUsers();
   const user = users.find(u => u.username === username);
 
-if (user && user.premiumUntil && Date.now() > user.premiumUntil) {
-  user.isPremium = false;
-  user.paidFeatures = { filtersUnlocked: false };
-  user.premiumUntil = null;
-  saveUsers(users);
-}
-if (user && (await bcrypt.compare(password, user.password))) {
-   const { sessionId, execToken } = createSession(
-  user.username,
-  Number(user.age) >= 18
-);
+  if (user && user.premiumUntil && Date.now() > user.premiumUntil) {
+    user.isPremium = false;
+    user.paidFeatures = { filtersUnlocked: false };
+    user.premiumUntil = null;
+    saveUsers(users);
+  }
+  if (user && (await bcrypt.compare(password, user.password))) {
+    const { sessionId, execToken } = createSession(
+      user.username,
+      Number(user.age) >= 18
+    );
 
-res.json({
-  message: 'Login successful! Welcome to JOLT.',
-  sessionId,
-  execToken, // 🔐 client must send this on socket connect
-  profile: {
-  username: user.username,
-  age: user.age || '',
-  bio: user.bio || '',
-  image: user.image || '',
-  gender: user.gender || '',
-  interests: user.interests || [],
-  isPremium: user.isPremium,
-  premiumUntil: user.premiumUntil
-}
-});
+    res.json({
+      message: 'Login successful! Welcome to JOLT.',
+      sessionId,
+      execToken, // Client must send this on socket connect
+      profile: {
+        username: user.username,
+        age: user.age || '',
+        bio: user.bio || '',
+        image: user.image || '',
+        gender: user.gender || '',
+        interests: user.interests || [],
+        coins: user.coins || 0,
+        isPremium: user.isPremium,
+        premiumUntil: user.premiumUntil
+      },
+      coins: user.coins || 0,
+      isPremium: user.isPremium,
+      premiumUntil: user.premiumUntil
+    });
 
 
   } else {
@@ -616,7 +755,7 @@ app.post('/profile/update', requireSession, (req, res) => {
 app.post('/buy-coins', requireSession, (req, res) => {
   const { amount } = req.body;
   const coinsToAdd = Number(amount) || 0;
-    if (coinsToAdd <= 0) {
+  if (coinsToAdd <= 0) {
     return res
       .status(400)
       .json({ message: 'Invalid coin amount.' });
@@ -640,17 +779,17 @@ app.post('/buy-coins', requireSession, (req, res) => {
 
 // --- VIRTUAL GIFTS: SEND GIFT USING COINS ---
 app.post('/gift', requireSession, (req, res) => {
-  const from = req.username; // 🔐 authoritative sender
+  const from = req.username; // Authoritative sender
   const { to, giftType, cost } = req.body;
-const giftCost = Number(cost) || 0;
+  const giftCost = Number(cost) || 0;
 
-if (!to || !giftType || giftCost <= 0) {
-  return res.status(400).json({ message: 'Invalid gift request.' });
-}
+  if (!to || !giftType || giftCost <= 0) {
+    return res.status(400).json({ message: 'Invalid gift request.' });
+  }
 
-if (to === from) {
-  return res.status(400).json({ message: 'You cannot gift yourself.' });
-}
+  if (to === from) {
+    return res.status(400).json({ message: 'You cannot gift yourself.' });
+  }
 
   let users = loadUsers();
   const sender = users.find(u => u.username === req.username);
@@ -692,7 +831,7 @@ if (to === from) {
       });
       break;
     }
-}
+  }
 
   return res.json({
     message: 'Gift sent successfully.',
@@ -700,11 +839,64 @@ if (to === from) {
   });
 });
 
-// ✅ WebRTC Partners Map
+// WebRTC Partners Map
 const partners = new Map();
-let waiting = null;
 
-// ✅ In-memory moderation state + bans
+// Queue-based matchmaking (replaces single waiting user)
+const matchmakingQueue = [];
+
+// Online users count endpoint - must be accessible without auth
+// Defined after matchmakingQueue to ensure it's accessible
+app.get('/online-count', (req, res) => {
+  console.log('[/online-count] Request received');
+  try {
+    // Count active sockets (connected users) - default to 0 if null/undefined
+    const onlineCount = (io && io.sockets && io.sockets.sockets) ? io.sockets.sockets.size : 0;
+    // Count users in matchmaking queue - default to 0 if null/undefined
+    const queuedCount = (matchmakingQueue && Array.isArray(matchmakingQueue)) ? matchmakingQueue.length : 0;
+    
+    // Ensure values are numbers, default to 0
+    const online = Number(onlineCount) || 0;
+    const queued = Number(queuedCount) || 0;
+    const inChat = Math.max(0, online - queued);
+    
+    console.log(`[/online-count] Returning: online=${online}, queued=${queued}, inChat=${inChat}`);
+    res.json({
+      online: online,
+      queued: queued,
+      inChat: inChat
+    });
+  } catch (error) {
+    console.error('[/online-count] Error getting online count:', error);
+    res.json({
+      online: 0,
+      queued: 0,
+      inChat: 0
+    });
+  }
+});
+
+// Skip history: username -> Set of recently matched/skipped usernames (with timestamps)
+// Format: { username: Set of { partner: string, timestamp: number } }
+const skipHistory = new Map();
+const SKIP_HISTORY_TTL = 5 * 60 * 1000; // 5 minutes - don't rematch within 5 min
+
+// Cleanup old skip history entries periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [username, history] of skipHistory.entries()) {
+    for (const entry of history) {
+      if (now - entry.timestamp > SKIP_HISTORY_TTL) {
+        history.delete(entry);
+      }
+    }
+    if (history.size === 0) {
+      skipHistory.delete(username);
+    }
+  }
+}, 60 * 1000); // Clean every minute
+
+// In-memory moderation state + bans
 // moderationState: username -> { strikes: number }
 const moderationState = new Map();
 // bans: usernames permanently banned by AI moderation
@@ -741,7 +933,7 @@ function isBanned(username) {
 function banUser(username, reason = '') {
   bans.add(username);
 
-  // 🔐 Invalidate all sessions for this user
+  // Invalidate all sessions for this user
   for (const [sid, sess] of sessions.entries()) {
     if (sess.username === username) {
       sessions.delete(sid);
@@ -759,7 +951,7 @@ function banUser(username, reason = '') {
   });
 
   console.log(
-    `⛔ User banned by AI moderation: ${username} ${reason ? `(${reason})` : ''}`
+    `User banned by AI moderation: ${username} ${reason ? `(${reason})` : ''}`
   );
 }
 
@@ -806,10 +998,10 @@ async function analyzeFrame(text) {
   }
 }
 
-// 🔐 MODERATION EVIDENCE LEDGER (append-only, audit-grade)
+// Moderation evidence ledger (append-only, audit-grade)
 const MOD_LOG_FILE = path.join(__dirname, 'moderation-log.jsonl');
 
-/* 🔐 Ensure moderation log is append-only & private */
+// Ensure moderation log is append-only & private
 if (!fs.existsSync(MOD_LOG_FILE)) {
   fs.writeFileSync(MOD_LOG_FILE, '', { mode: 0o600 });
 }
@@ -879,12 +1071,12 @@ io.use((socket, next) => {
     return next(new Error('Unauthorized socket'));
   }
 
-  // 🔐 EXEC TOKEN REPLAY PROTECTION
+  // Exec token replay protection
   if (session.execToken !== execToken) {
     return next(new Error('Invalid exec token'));
   }
 
-  // 🔐 RECONNECT THROTTLE (1 reconnect / 3s)
+  // Reconnect throttle (1 reconnect per 3s)
   const now = Date.now();
   const last = reconnectThrottle.get(sessionId) || 0;
 
@@ -894,7 +1086,7 @@ io.use((socket, next) => {
 
   reconnectThrottle.set(sessionId, now);
 
-  // 🔐 SINGLE ACTIVE SOCKET PER SESSION
+  // Single active socket per session
   const existingSocketId = activeSockets.get(sessionId);
   if (existingSocketId && existingSocketId !== socket.id) {
     const oldSocket = io.sockets.sockets.get(existingSocketId);
@@ -916,15 +1108,17 @@ io.use((socket, next) => {
 
 io.on('connection', socket => {
   console.log(
-    `🔌 New connection: ${socket.id} (user=${socket.username || 'unknown'}, session=${socket.sessionId || 'n/a'})`
+    `New connection: ${socket.id} (user=${socket.username || 'unknown'}, session=${socket.sessionId || 'n/a'})`
   );
 
-  /* 🔐 SAFETY: clear stale waiting socket (ghost cleanup) */
-  if (waiting && waiting.socket && waiting.socket.disconnected) {
-    waiting = null;
+  // Cleanup stale queue entries (ghost cleanup)
+  for (let i = matchmakingQueue.length - 1; i >= 0; i--) {
+    if (matchmakingQueue[i].socket.disconnected) {
+      matchmakingQueue.splice(i, 1);
+    }
   }
 
-  /* 🔐 SAFETY: prevent duplicate active socket binding */
+  // Prevent duplicate active socket binding
   if (socket.sessionId) {
     activeSockets.set(socket.sessionId, socket.id);
   }
@@ -952,7 +1146,7 @@ io.on('connection', socket => {
 
     if (entry.count > limit) {
       console.warn(
-        `⛔ Socket abuse: ${bucket} limit exceeded by ${socket.username || socket.id}`
+        `Socket abuse: ${bucket} limit exceeded by ${socket.username || socket.id}`
       );
       return false;
     }
@@ -963,17 +1157,30 @@ io.on('connection', socket => {
   /* ================= PARTNER CLEANUP ================= */
   function cleanupPartner(sock) {
     try {
-      if (sock.partner) {
-        sock.partner.emit('chatEnded');
-        sock.partner.partner = null;
-        partners.delete(sock.partner.id);
+      if (sock && sock.partner) {
+        const partner = sock.partner;
+        // Check if partner socket is still valid
+        if (partner && partner.id) {
+          try {
+            partner.emit('chatEnded');
+            partner.partner = null;
+            partners.delete(partner.id);
+          } catch (err) {
+            // Partner socket might be disconnected
+            console.warn('Partner socket already disconnected during cleanup');
+          }
+        }
       }
     } catch (err) {
       console.error('Partner cleanup error:', err);
     }
 
-    sock.partner = null;
-    partners.delete(sock.id);
+    if (sock) {
+      sock.partner = null;
+      if (sock.id) {
+        partners.delete(sock.id);
+      }
+    }
   }
 
   /* ================= MODERATION ================= */
@@ -981,10 +1188,10 @@ io.on('connection', socket => {
 
   socket.on('moderate-frame', async payload => {
     try {
-     if (!socketThrottle('moderation', 10, 10_000)) return;
- if (!MODERATION_ENABLED) {
-  return; // 🔐 moderation hard-disabled (safe bypass)
-}
+      if (!socketThrottle('moderation', 10, 10_000)) return;
+      if (!MODERATION_ENABLED) {
+        return; // Moderation hard-disabled (safe bypass)
+      }
       const username = payload?.username || socket.username;
       const text = payload?.text || '';
       const frame =
@@ -1073,12 +1280,105 @@ io.on('connection', socket => {
   /* ================= MATCHMAKING ================= */
   let lastJoinAt = 0;
 
-socket.on('joinChat', data => {
-  if (Date.now() - lastJoinAt < 3000) {
-    socket.emit('error', { message: 'Too many requests. Please wait.' });
-    return;
+  // Helper function to get skip history for a user
+  function getRecentMatches(username) {
+    if (!skipHistory.has(username)) {
+      skipHistory.set(username, new Set());
+    }
+    return skipHistory.get(username);
   }
-  lastJoinAt = Date.now();
+
+  // Helper function to add to skip history
+  function addToSkipHistory(username1, username2) {
+    const history1 = getRecentMatches(username1);
+    const history2 = getRecentMatches(username2);
+    const now = Date.now();
+    history1.add(JSON.stringify({ partner: username2.toLowerCase(), timestamp: now }));
+    history2.add(JSON.stringify({ partner: username1.toLowerCase(), timestamp: now }));
+  }
+
+  // Helper function to check if users were recently matched
+  function wasRecentlyMatched(username1, username2) {
+    const history = getRecentMatches(username1);
+    for (const entry of history) {
+      const parsed = JSON.parse(entry);
+      if (parsed.partner === username2.toLowerCase()) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // Helper function to find best match from queue (avoiding recent matches)
+  function findBestMatch(currentUser, currentSocket, genderFilter, interestFilter, isPremium) {
+    // Shuffle queue to randomize matches
+    const shuffled = [...matchmakingQueue].sort(() => Math.random() - 0.5);
+    
+    for (let i = 0; i < shuffled.length; i++) {
+      const candidate = shuffled[i];
+      
+      // Skip if same user
+      if (candidate.username.toLowerCase() === currentUser.toLowerCase()) {
+        continue;
+      }
+      
+      // Skip if socket is disconnected
+      if (candidate.socket.disconnected) {
+        matchmakingQueue.splice(matchmakingQueue.indexOf(candidate), 1);
+        continue;
+      }
+      
+      // Skip if recently matched
+      if (wasRecentlyMatched(currentUser, candidate.username)) {
+        continue;
+      }
+      
+      // Check filters (premium feature)
+      if (candidate.isPremium && (candidate.genderFilter || candidate.interestFilter.length > 0)) {
+        const candidateUser = loadUsers().find(u => u.username === candidate.username);
+        if (candidateUser) {
+          if (candidate.genderFilter && candidateUser.gender?.toLowerCase() !== candidate.genderFilter.toLowerCase()) {
+            continue;
+          }
+          if (candidate.interestFilter.length > 0) {
+            const userInterests = candidateUser.interests || [];
+            const hasCommonInterest = candidate.interestFilter.some(interest => 
+              userInterests.some(ui => ui.toLowerCase() === interest.toLowerCase())
+            );
+            if (!hasCommonInterest) continue;
+          }
+        }
+      }
+      
+      // Check if current user matches candidate's filters
+      if (isPremium && (genderFilter || interestFilter.length > 0)) {
+        const currentUserData = loadUsers().find(u => u.username === currentUser);
+        if (currentUserData) {
+          if (genderFilter && currentUserData.gender?.toLowerCase() !== genderFilter.toLowerCase()) {
+            continue;
+          }
+          if (interestFilter.length > 0) {
+            const userInterests = currentUserData.interests || [];
+            const hasCommonInterest = interestFilter.some(interest => 
+              userInterests.some(ui => ui.toLowerCase() === interest.toLowerCase())
+            );
+            if (!hasCommonInterest) continue;
+          }
+        }
+      }
+      
+      return candidate;
+    }
+    
+    return null;
+  }
+
+  socket.on('joinChat', data => {
+    if (Date.now() - lastJoinAt < 3000) {
+      socket.emit('error', { message: 'Too many requests. Please wait.' });
+      return;
+    }
+    lastJoinAt = Date.now();
 
     if (socket.partner) cleanupPartner(socket);
 
@@ -1127,48 +1427,70 @@ socket.on('joinChat', data => {
       return;
     }
 
-    if (!waiting) {
-      waiting = {
+    // Remove user from queue if already there
+    const existingIndex = matchmakingQueue.findIndex(q => q.username === username || q.socket.id === socket.id);
+    if (existingIndex !== -1) {
+      matchmakingQueue.splice(existingIndex, 1);
+    }
+
+    // Try to find a match
+    const match = findBestMatch(username, socket, genderFilter, interestFilter, isPremium);
+    
+    if (!match) {
+      // No match found, add to queue
+      matchmakingQueue.push({
         socket,
         username,
         genderFilter,
         interestFilter,
-        isPremium
-      };
+        isPremium,
+        joinedAt: Date.now()
+      });
       socket.emit('waiting');
       return;
     }
 
-    const partner = waiting;
-    waiting = null;
+    // Found a match! Remove from queue
+    const matchIndex = matchmakingQueue.findIndex(q => q.socket.id === match.socket.id);
+    if (matchIndex !== -1) {
+      matchmakingQueue.splice(matchIndex, 1);
+    }
 
-    socket.partner = partner.socket;
-    partner.socket.partner = socket;
+    // Create partnership
+    socket.partner = match.socket;
+    match.socket.partner = socket;
 
-    partners.set(socket.id, partner.socket.id);
-    partners.set(partner.socket.id, socket.id);
+    partners.set(socket.id, match.socket.id);
+    partners.set(match.socket.id, socket.id);
 
-    socket.emit('matched', partner.username);
-    partner.socket.emit('matched', username);
+    // Add to skip history (will be removed after chat ends or skip)
+    addToSkipHistory(username, match.username);
+
+    socket.emit('matched', match.username);
+    match.socket.emit('matched', username);
 
     socket.emit('start-webrtc', { initiator: true });
-    partner.socket.emit('start-webrtc', { initiator: false });
+    match.socket.emit('start-webrtc', { initiator: false });
   });
 
   /* ================= CHAT ================= */
   socket.on('chatMsg', msg => {
-  if (!socketThrottle('chat', 40, 10_000)) return;
-  if (socket.partner) socket.partner.emit('chatMsg', msg);
-});
+    if (!socketThrottle('chat', 40, 10_000)) return;
+    if (socket.partner) socket.partner.emit('chatMsg', msg);
+  });
 
   socket.on('endChat', () => {
+    // If there was a partner, add to skip history before cleanup
+    if (socket.partner && socket.username && socket.partner.username) {
+      addToSkipHistory(socket.username, socket.partner.username);
+    }
     cleanupPartner(socket);
   });
 
   /* ================= WEBRTC ================= */
   ['webrtc-offer', 'webrtc-answer', 'webrtc-ice-candidate'].forEach(evt => {
-  socket.on(evt, data => {
-    if (!socketThrottle('signal', 80, 10_000)) return;
+    socket.on(evt, data => {
+      if (!socketThrottle('signal', 80, 10_000)) return;
       const partnerId = partners.get(socket.id);
       if (!partnerId) return;
 
@@ -1186,30 +1508,30 @@ socket.on('joinChat', data => {
   });
 
   socket.on('disconnect', () => {
-  if (waiting && waiting.socket === socket) waiting = null;
+    // Remove from matchmaking queue
+    const queueIndex = matchmakingQueue.findIndex(q => q.socket.id === socket.id);
+    if (queueIndex !== -1) {
+      matchmakingQueue.splice(queueIndex, 1);
+    }
 
-  cleanupPartner(socket);
+    cleanupPartner(socket);
 
-  // 🔐 Remove active socket binding
-  if (socket.sessionId) {
-    activeSockets.delete(socket.sessionId);
-  }
+    // Remove active socket binding
+    if (socket.sessionId) {
+      activeSockets.delete(socket.sessionId);
+    }
 
-  console.log(`🔌 Disconnected: ${socket.id}`);
+    console.log(`Disconnected: ${socket.id}`);
+  });
 });
-});
-module.exports.loadUsers = loadUsers;
-module.exports.saveUsers = saveUsers;
 require('./payments/razorpay')(app, requireSession);
 require('./payments/paypal')(app, requireSession);
 server.listen(port, () => {
+  console.log(`JOLT backend with WebRTC signaling running at http://localhost:${port}`);
+  console.log('Socket.IO transports: websocket, polling');
   console.log(
-    `✅ JOLT backend with WebRTC signaling running at http://localhost:${port}`
+    MODERATION_ENABLED
+      ? 'AI moderation ENABLED (Perspective API)'
+      : 'AI moderation DISABLED (safe mode)'
   );
-  console.log('📡 Socket.IO transports: websocket, polling');
-  console.log(
-  MODERATION_ENABLED
-    ? '🛡️ AI moderation ENABLED (Perspective API)'
-    : '⚠️ AI moderation DISABLED (safe mode)'
-);
 });

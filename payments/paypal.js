@@ -1,29 +1,47 @@
+// Load environment variables
+require('dotenv').config();
+
 const paypal = require('@paypal/checkout-server-sdk');
 const plans = require('./plans');
-const { loadUsers, saveUsers } = require('../server');
+const { loadUsers, saveUsers } = require('../users');
 
 /* =========================
    PAYPAL CLIENT
 ========================= */
 
+let paypalClient = null;
+let paypalEnabled = false;
+
 function getPayPalClient() {
   const clientId = process.env.PAYPAL_CLIENT_ID;
   const clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+  const mode = process.env.PAYPAL_MODE || 'sandbox'; // default to sandbox
 
   if (!clientId || !clientSecret) {
-    console.warn('⚠️ PayPal not initialized: missing env vars');
+    console.warn('⚠️ PayPal not initialized - Missing environment variables');
+    console.warn('   Required: PAYPAL_CLIENT_ID and PAYPAL_CLIENT_SECRET');
+    console.warn('   Optional: PAYPAL_MODE (default: sandbox)');
+    console.warn('   Add these to your .env file in jolt-backend directory');
     return null;
   }
 
-  const environment =
-    process.env.PAYPAL_MODE === 'live'
-      ? new paypal.core.LiveEnvironment(clientId, clientSecret)
-      : new paypal.core.SandboxEnvironment(clientId, clientSecret);
+  try {
+    const environment =
+      mode === 'live'
+        ? new paypal.core.LiveEnvironment(clientId, clientSecret)
+        : new paypal.core.SandboxEnvironment(clientId, clientSecret);
 
-  return new paypal.core.PayPalHttpClient(environment);
+    const client = new paypal.core.PayPalHttpClient(environment);
+    console.log(`✅ PayPal initialized successfully (${mode} mode)`);
+    return client;
+  } catch (error) {
+    console.error('❌ PayPal initialization error:', error.message);
+    return null;
+  }
 }
 
-const paypalClient = getPayPalClient();
+paypalClient = getPayPalClient();
+paypalEnabled = !!paypalClient;
 
 /* =========================
    ROUTES
@@ -35,15 +53,22 @@ module.exports = function paypalRoutes(app, requireSession) {
      1️⃣ CREATE ORDER
   ========================= */
   app.post('/payments/paypal/create-order', requireSession, async (req, res) => {
-    if (!paypalClient) {
-      return res.status(503).json({ message: 'PayPal not configured' });
+    if (!paypalClient || !paypalEnabled) {
+      return res.status(503).json({ 
+        message: 'PayPal payments are not configured. Please check server configuration.',
+        error: 'PAYPAL_NOT_CONFIGURED'
+      });
     }
 
     const { plan } = req.body;
+    if (!plan) {
+      return res.status(400).json({ message: 'Plan is required' });
+    }
+
     const planConfig = plans[plan];
 
-    if (!planConfig) {
-      return res.status(400).json({ message: 'Invalid plan' });
+    if (!planConfig || !planConfig.usd) {
+      return res.status(400).json({ message: 'Invalid plan selected' });
     }
 
     try {
@@ -53,6 +78,7 @@ module.exports = function paypalRoutes(app, requireSession) {
         intent: 'CAPTURE',
         purchase_units: [
           {
+            description: `${planConfig.label} Premium Plan`,
             amount: {
               currency_code: 'USD',
               value: planConfig.usd
@@ -62,11 +88,25 @@ module.exports = function paypalRoutes(app, requireSession) {
       });
 
       const order = await paypalClient.execute(request);
-      res.json({ orderId: order.result.id });
+      
+      if (order.statusCode !== 201 || !order.result || !order.result.id) {
+        throw new Error('Invalid order response from PayPal');
+      }
+
+      console.log('✅ PayPal order created:', order.result.id);
+
+      res.json({ 
+        orderId: order.result.id,
+        status: order.result.status
+      });
 
     } catch (err) {
       console.error('❌ PayPal create-order error:', err);
-      res.status(500).json({ message: 'PayPal order creation failed' });
+      const errorMessage = err.message || (err.response?.body?.message) || 'Unknown error';
+      res.status(500).json({ 
+        message: 'PayPal order creation failed: ' + errorMessage,
+        error: 'ORDER_CREATION_FAILED'
+      });
     }
   });
 
@@ -74,15 +114,27 @@ module.exports = function paypalRoutes(app, requireSession) {
      2️⃣ CAPTURE PAYMENT
   ========================= */
   app.post('/payments/paypal/capture', requireSession, async (req, res) => {
-    if (!paypalClient) {
-      return res.status(503).json({ message: 'PayPal not configured' });
+    if (!paypalClient || !paypalEnabled) {
+      return res.status(503).json({ 
+        message: 'PayPal payments are not configured. Please check server configuration.',
+        error: 'PAYPAL_NOT_CONFIGURED'
+      });
     }
 
     const { orderId, plan } = req.body;
+
+    if (!orderId) {
+      return res.status(400).json({ message: 'Order ID is required' });
+    }
+
+    if (!plan) {
+      return res.status(400).json({ message: 'Plan is required' });
+    }
+
     const planConfig = plans[plan];
 
-    if (!orderId || !planConfig || !planConfig.durationDays) {
-      return res.status(400).json({ message: 'Invalid order or plan' });
+    if (!planConfig || !planConfig.durationDays) {
+      return res.status(400).json({ message: 'Invalid plan selected' });
     }
 
     try {
@@ -90,9 +142,14 @@ module.exports = function paypalRoutes(app, requireSession) {
       request.requestBody({});
       const capture = await paypalClient.execute(request);
 
-      if (capture.result.status !== 'COMPLETED') {
-        return res.status(400).json({ message: 'Payment not completed' });
+      if (!capture.result || capture.result.status !== 'COMPLETED') {
+        return res.status(400).json({ 
+          message: 'Payment not completed. Status: ' + (capture.result?.status || 'Unknown'),
+          error: 'PAYMENT_NOT_COMPLETED'
+        });
       }
+
+      console.log('✅ PayPal payment captured:', orderId);
 
       // ✅ APPLY PREMIUM (SAME AS RAZORPAY)
       const users = loadUsers();
@@ -124,7 +181,11 @@ module.exports = function paypalRoutes(app, requireSession) {
 
     } catch (err) {
       console.error('❌ PayPal capture error:', err);
-      res.status(500).json({ message: 'PayPal capture failed' });
+      const errorMessage = err.message || (err.response?.body?.message) || 'Unknown error';
+      res.status(500).json({ 
+        message: 'PayPal capture failed: ' + errorMessage,
+        error: 'CAPTURE_FAILED'
+      });
     }
   });
 };

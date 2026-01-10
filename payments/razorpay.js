@@ -1,23 +1,36 @@
+// Load environment variables
+require('dotenv').config();
+
 const crypto = require('crypto');
 const plans = require('./plans');
-const { loadUsers, saveUsers } = require('../server');
+const { loadUsers, saveUsers } = require('../users');
 const Razorpay = require('razorpay');
 
 // ================================
 // 🔐 SAFE RAZORPAY INITIALIZATION
 // ================================
 let razorpay = null;
+let razorpayEnabled = false;
 
-if (
-  process.env.RAZORPAY_KEY_ID &&
-  process.env.RAZORPAY_KEY_SECRET
-) {
-  razorpay = new Razorpay({
-    key_id: process.env.RAZORPAY_KEY_ID,
-    key_secret: process.env.RAZORPAY_KEY_SECRET
-  });
+const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID || process.env.RAZORPAY_KEY;
+const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET || process.env.RAZORPAY_SECRET;
+
+if (RAZORPAY_KEY_ID && RAZORPAY_KEY_SECRET) {
+  try {
+    razorpay = new Razorpay({
+      key_id: RAZORPAY_KEY_ID,
+      key_secret: RAZORPAY_KEY_SECRET
+    });
+    razorpayEnabled = true;
+    console.log('✅ Razorpay initialized successfully');
+  } catch (error) {
+    console.error('❌ Razorpay initialization error:', error.message);
+    razorpayEnabled = false;
+  }
 } else {
-  console.warn('⚠️ Razorpay disabled (missing env vars)');
+  console.warn('⚠️ Razorpay disabled - Missing environment variables');
+  console.warn('   Required: RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET');
+  console.warn('   Add these to your .env file in jolt-backend directory');
 }
 
 // ================================
@@ -32,41 +45,52 @@ module.exports = function razorpayRoutes(app, requireSession) {
     '/payments/razorpay/create-order',
     requireSession,
     async (req, res) => {
-      if (!razorpay) {
+      if (!razorpay || !razorpayEnabled) {
         return res.status(503).json({
-          message: 'Payments temporarily unavailable'
+          message: 'Razorpay payments are not configured. Please check server configuration.',
+          error: 'RAZORPAY_NOT_CONFIGURED'
         });
       }
 
       const { plan } = req.body;
+      if (!plan) {
+        return res.status(400).json({
+          message: 'Plan is required'
+        });
+      }
+
       const planConfig = plans[plan];
 
       if (!planConfig || !planConfig.inr) {
         return res.status(400).json({
-          message: 'Invalid plan'
+          message: 'Invalid plan selected'
         });
       }
 
       try {
         const order = await razorpay.orders.create({
-  amount: plans[plan].inr,
-  currency: 'INR',
-  receipt: `jolt_${req.username}_${Date.now()}`,
-  notes: {
-    username: req.username,
-    plan
-  }
-});
+          amount: plans[plan].inr,
+          currency: 'INR',
+          receipt: `jolt_${req.username}_${Date.now()}`,
+          notes: {
+            username: req.username,
+            plan
+          }
+        });
+
+        console.log('✅ Razorpay order created:', order.id);
 
         res.json({
           orderId: order.id,
-          keyId: process.env.RAZORPAY_KEY_ID,
-          amount: order.amount
+          keyId: RAZORPAY_KEY_ID,
+          amount: order.amount,
+          currency: 'INR'
         });
       } catch (err) {
-        console.error('❌ Razorpay order error:', err);
+        console.error('❌ Razorpay order creation error:', err);
         res.status(500).json({
-          message: 'Order creation failed'
+          message: 'Order creation failed: ' + (err.error?.description || err.message || 'Unknown error'),
+          error: 'ORDER_CREATION_FAILED'
         });
       }
     }
@@ -104,7 +128,7 @@ module.exports = function razorpayRoutes(app, requireSession) {
       const expectedSignature = crypto
         .createHmac(
           'sha256',
-          process.env.RAZORPAY_KEY_SECRET
+          RAZORPAY_KEY_SECRET
         )
         .update(body)
         .digest('hex');
